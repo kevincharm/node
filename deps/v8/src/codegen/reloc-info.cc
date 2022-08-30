@@ -104,7 +104,7 @@ void RelocInfoWriter::WriteShortData(intptr_t data_delta) {
 }
 
 void RelocInfoWriter::WriteMode(RelocInfo::Mode rmode) {
-  STATIC_ASSERT(RelocInfo::NUMBER_OF_MODES <= (1 << kLongTagBits));
+  static_assert(RelocInfo::NUMBER_OF_MODES <= (1 << kLongTagBits));
   *--pos_ = static_cast<int>((rmode << kTagBits) | kDefaultTag);
 }
 
@@ -120,14 +120,6 @@ void RelocInfoWriter::WriteIntData(int number) {
     *--pos_ = static_cast<byte>(number);
     // Signed right shift is arithmetic shift.  Tested in test-utils.cc.
     number = number >> kBitsPerByte;
-  }
-}
-
-void RelocInfoWriter::WriteData(intptr_t data_delta) {
-  for (int i = 0; i < kIntptrSize; i++) {
-    *--pos_ = static_cast<byte>(data_delta);
-    // Signed right shift is arithmetic shift.  Tested in test-utils.cc.
-    data_delta = data_delta >> kBitsPerByte;
   }
 }
 
@@ -317,10 +309,11 @@ bool RelocInfo::OffHeapTargetIsCodedSpecially() {
 #if defined(V8_TARGET_ARCH_ARM) || defined(V8_TARGET_ARCH_ARM64) || \
     defined(V8_TARGET_ARCH_X64)
   return false;
-#elif defined(V8_TARGET_ARCH_IA32) || defined(V8_TARGET_ARCH_MIPS) || \
-    defined(V8_TARGET_ARCH_MIPS64) || defined(V8_TARGET_ARCH_PPC) ||  \
-    defined(V8_TARGET_ARCH_PPC64) || defined(V8_TARGET_ARCH_S390) ||  \
-    defined(V8_TARGET_ARCH_RISCV64) || defined(V8_TARGET_ARCH_LOONG64)
+#elif defined(V8_TARGET_ARCH_IA32) || defined(V8_TARGET_ARCH_MIPS) ||     \
+    defined(V8_TARGET_ARCH_MIPS64) || defined(V8_TARGET_ARCH_PPC) ||      \
+    defined(V8_TARGET_ARCH_PPC64) || defined(V8_TARGET_ARCH_S390) ||      \
+    defined(V8_TARGET_ARCH_RISCV64) || defined(V8_TARGET_ARCH_LOONG64) || \
+    defined(V8_TARGET_ARCH_RISCV32)
   return true;
 #endif
 }
@@ -356,11 +349,18 @@ void RelocInfo::set_target_address(Address target,
          IsWasmCall(rmode_));
   Assembler::set_target_address_at(pc_, constant_pool_, target,
                                    icache_flush_mode);
-  if (write_barrier_mode == UPDATE_WRITE_BARRIER && !host().is_null() &&
-      IsCodeTargetMode(rmode_) && !FLAG_disable_write_barriers) {
+  if (!host().is_null() && IsCodeTargetMode(rmode_) &&
+      !FLAG_disable_write_barriers) {
     Code target_code = Code::GetCodeFromTargetAddress(target);
-    WriteBarrier::Marking(host(), this, target_code);
+    WriteBarrierForCode(host(), this, target_code, write_barrier_mode);
   }
+}
+
+void RelocInfo::set_off_heap_target_address(Address target,
+                                            ICacheFlushMode icache_flush_mode) {
+  DCHECK(IsCodeTargetMode(rmode_));
+  Assembler::set_target_address_at(pc_, constant_pool_, target,
+                                   icache_flush_mode);
 }
 
 bool RelocInfo::HasTargetAddressAddress() const {
@@ -504,16 +504,18 @@ void RelocInfo::Verify(Isolate* isolate) {
       CHECK_NE(addr, kNullAddress);
       // Check that we can find the right code object.
       Code code = Code::GetCodeFromTargetAddress(addr);
-      Object found = isolate->FindCodeObject(addr);
-      CHECK(found.IsCode());
-      CHECK(code.address() == HeapObject::cast(found).address());
+      CodeLookupResult lookup_result = isolate->FindCodeObject(addr);
+      CHECK(lookup_result.IsFound());
+      CHECK_EQ(code.address(), lookup_result.code().address());
       break;
     }
     case INTERNAL_REFERENCE:
     case INTERNAL_REFERENCE_ENCODED: {
       Address target = target_internal_reference();
       Address pc = target_internal_reference_address();
-      Code code = Code::cast(isolate->FindCodeObject(pc));
+      CodeLookupResult lookup_result = isolate->FindCodeObject(pc);
+      CHECK(lookup_result.IsFound());
+      Code code = lookup_result.code();
       CHECK(target >= code.InstructionStart(isolate, pc));
       CHECK(target <= code.InstructionEnd(isolate, pc));
       break;

@@ -6,7 +6,6 @@
 #define V8_INTERPRETER_BYTECODE_ARRAY_BUILDER_H_
 
 #include "src/ast/ast.h"
-#include "src/base/compiler-specific.h"
 #include "src/base/export-template.h"
 #include "src/common/globals.h"
 #include "src/interpreter/bytecode-array-writer.h"
@@ -17,7 +16,6 @@
 #include "src/interpreter/bytecodes.h"
 #include "src/interpreter/constant-array-builder.h"
 #include "src/interpreter/handler-table-builder.h"
-#include "src/zone/zone-containers.h"
 
 namespace v8 {
 namespace internal {
@@ -428,7 +426,8 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
 
   BytecodeArrayBuilder& Jump(BytecodeLabel* label);
   BytecodeArrayBuilder& JumpLoop(BytecodeLoopHeader* loop_header,
-                                 int loop_depth, int position);
+                                 int loop_depth, int position,
+                                 int feedback_slot);
 
   BytecodeArrayBuilder& JumpIfTrue(ToBooleanMode mode, BytecodeLabel* label);
   BytecodeArrayBuilder& JumpIfFalse(ToBooleanMode mode, BytecodeLabel* label);
@@ -491,6 +490,10 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   // constant pool.
   BytecodeJumpTable* AllocateJumpTable(int size, int case_value_base);
 
+  BytecodeRegisterOptimizer* GetRegisterOptimizer() {
+    return register_optimizer_;
+  }
+
   // Gets a constant pool entry.
   size_t GetConstantPoolEntry(const AstRawString* raw_string);
   size_t GetConstantPoolEntry(AstBigInt bigint);
@@ -511,7 +514,11 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
     SetStatementPosition(stmt->position());
   }
 
-  BytecodeSourceInfo PopSourcePosition() {
+  base::Optional<BytecodeSourceInfo> MaybePopSourcePosition(int scope_start) {
+    if (!latest_source_info_.is_valid() ||
+        latest_source_info_.source_position() < scope_start) {
+      return base::nullopt;
+    }
     BytecodeSourceInfo source_info = latest_source_info_;
     latest_source_info_.set_invalid();
     return source_info;
@@ -594,8 +601,8 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   BYTECODE_LIST(DECLARE_BYTECODE_OUTPUT)
 #undef DECLARE_OPERAND_TYPE_INFO
 
-  V8_INLINE void OutputJumpLoop(BytecodeLoopHeader* loop_header,
-                                int loop_depth);
+  V8_INLINE void OutputJumpLoop(BytecodeLoopHeader* loop_header, int loop_depth,
+                                int feedback_slot);
   V8_INLINE void OutputSwitchOnSmiNoFeedback(BytecodeJumpTable* jump_table);
 
   bool RegisterIsValid(Register reg) const;

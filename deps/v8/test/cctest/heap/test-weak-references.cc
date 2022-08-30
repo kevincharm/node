@@ -267,8 +267,7 @@ TEST(ObjectWithWeakReferencePromoted) {
   CHECK(Heap::InYoungGeneration(*fixed_array));
   lh->set_data1(HeapObjectReference::Weak(*fixed_array));
 
-  CcTest::CollectGarbage(NEW_SPACE);
-  CcTest::CollectGarbage(NEW_SPACE);
+  CcTest::CollectGarbage(OLD_SPACE);
   CHECK(heap->InOldSpace(*lh));
   CHECK(heap->InOldSpace(*fixed_array));
 
@@ -290,11 +289,7 @@ TEST(ObjectWithClearedWeakReferencePromoted) {
 
   lh->set_data1(HeapObjectReference::ClearedValue(isolate));
 
-  CcTest::CollectGarbage(NEW_SPACE);
-  CHECK(Heap::InYoungGeneration(*lh));
-  CHECK(lh->data1()->IsCleared());
-
-  CcTest::CollectGarbage(NEW_SPACE);
+  CcTest::CollectGarbage(OLD_SPACE);
   CHECK(heap->InOldSpace(*lh));
   CHECK(lh->data1()->IsCleared());
 
@@ -622,7 +617,7 @@ TEST(Regress7768) {
 
   // Make sure the memory where it's stored is invalidated, so that we'll crash
   // if we try to access it.
-  HeapTester::UncommitFromSpace(heap);
+  HeapTester::UncommitUnusedMemory(heap);
 
   // This used to crash when processing the dead weak reference.
   CcTest::CollectAllGarbage();

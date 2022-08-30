@@ -10,6 +10,7 @@
 #include "src/base/memory.h"
 #include "src/codegen/arm64/assembler-arm64.h"
 #include "src/codegen/assembler.h"
+#include "src/codegen/flush-instruction-cache.h"
 #include "src/debug/debug.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/smi.h"
@@ -194,8 +195,8 @@ template <typename T>
 struct ImmediateInitializer {
   static inline RelocInfo::Mode rmode_for(T) { return RelocInfo::NO_INFO; }
   static inline int64_t immediate_for(T t) {
-    STATIC_ASSERT(sizeof(T) <= 8);
-    STATIC_ASSERT(std::is_integral<T>::value || std::is_enum<T>::value);
+    static_assert(sizeof(T) <= 8);
+    static_assert(std::is_integral<T>::value || std::is_enum<T>::value);
     return t;
   }
 };
@@ -232,7 +233,7 @@ Immediate::Immediate(T t)
 template <typename T>
 Immediate::Immediate(T t, RelocInfo::Mode rmode)
     : value_(ImmediateInitializer<T>::immediate_for(t)), rmode_(rmode) {
-  STATIC_ASSERT(std::is_integral<T>::value);
+  static_assert(std::is_integral<T>::value);
 }
 
 template <typename T>
@@ -267,21 +268,21 @@ Operand::Operand(Register reg, Extend extend, unsigned shift_amount)
   DCHECK(reg.Is64Bits() || ((extend != SXTX) && (extend != UXTX)));
 }
 
-bool Operand::IsHeapObjectRequest() const {
-  DCHECK_IMPLIES(heap_object_request_.has_value(), reg_ == NoReg);
-  DCHECK_IMPLIES(heap_object_request_.has_value(),
+bool Operand::IsHeapNumberRequest() const {
+  DCHECK_IMPLIES(heap_number_request_.has_value(), reg_ == NoReg);
+  DCHECK_IMPLIES(heap_number_request_.has_value(),
                  immediate_.rmode() == RelocInfo::FULL_EMBEDDED_OBJECT ||
                      immediate_.rmode() == RelocInfo::CODE_TARGET);
-  return heap_object_request_.has_value();
+  return heap_number_request_.has_value();
 }
 
-HeapObjectRequest Operand::heap_object_request() const {
-  DCHECK(IsHeapObjectRequest());
-  return *heap_object_request_;
+HeapNumberRequest Operand::heap_number_request() const {
+  DCHECK(IsHeapNumberRequest());
+  return *heap_number_request_;
 }
 
 bool Operand::IsImmediate() const {
-  return reg_ == NoReg && !IsHeapObjectRequest();
+  return reg_ == NoReg && !IsHeapNumberRequest();
 }
 
 bool Operand::IsShiftedRegister() const {
@@ -318,11 +319,8 @@ Operand Operand::ToW() const {
   return *this;
 }
 
-Immediate Operand::immediate_for_heap_object_request() const {
-  DCHECK((heap_object_request().kind() == HeapObjectRequest::kHeapNumber &&
-          immediate_.rmode() == RelocInfo::FULL_EMBEDDED_OBJECT) ||
-         (heap_object_request().kind() == HeapObjectRequest::kStringConstant &&
-          immediate_.rmode() == RelocInfo::FULL_EMBEDDED_OBJECT));
+Immediate Operand::immediate_for_heap_number_request() const {
+  DCHECK(immediate_.rmode() == RelocInfo::FULL_EMBEDDED_OBJECT);
   return immediate_;
 }
 
@@ -337,7 +335,7 @@ int64_t Operand::ImmediateValue() const {
 }
 
 RelocInfo::Mode Operand::ImmediateRMode() const {
-  DCHECK(IsImmediate() || IsHeapObjectRequest());
+  DCHECK(IsImmediate() || IsHeapNumberRequest());
   return immediate_.rmode();
 }
 
@@ -504,7 +502,7 @@ AssemblerBase::EmbeddedObjectIndex
 Assembler::embedded_object_index_referenced_from(Address pc) {
   Instruction* instr = reinterpret_cast<Instruction*>(pc);
   if (instr->IsLdrLiteralX()) {
-    STATIC_ASSERT(sizeof(EmbeddedObjectIndex) == sizeof(intptr_t));
+    static_assert(sizeof(EmbeddedObjectIndex) == sizeof(intptr_t));
     return Memory<EmbeddedObjectIndex>(target_pointer_address_at(pc));
   } else {
     DCHECK(instr->IsLdrLiteralW());
@@ -701,9 +699,8 @@ void RelocInfo::set_target_object(Heap* heap, HeapObject target,
     Assembler::set_target_address_at(pc_, constant_pool_, target.ptr(),
                                      icache_flush_mode);
   }
-  if (write_barrier_mode == UPDATE_WRITE_BARRIER && !host().is_null() &&
-      !FLAG_disable_write_barriers) {
-    WriteBarrierForCode(host(), this, target);
+  if (!host().is_null() && !FLAG_disable_write_barriers) {
+    WriteBarrierForCode(host(), this, target, write_barrier_mode);
   }
 }
 
@@ -1063,21 +1060,6 @@ Instr Assembler::FPScale(unsigned scale) {
 
 const Register& Assembler::AppropriateZeroRegFor(const CPURegister& reg) const {
   return reg.Is64Bits() ? xzr : wzr;
-}
-
-inline void Assembler::CheckBufferSpace() {
-  DCHECK_LT(pc_, buffer_start_ + buffer_->size());
-  if (V8_UNLIKELY(buffer_space() < kGap)) {
-    GrowBuffer();
-  }
-}
-
-V8_INLINE void Assembler::CheckBuffer() {
-  CheckBufferSpace();
-  if (pc_offset() >= next_veneer_pool_check_) {
-    CheckVeneerPool(false, true);
-  }
-  constpool_.MaybeCheck();
 }
 
 EnsureSpace::EnsureSpace(Assembler* assembler) : block_pools_scope_(assembler) {

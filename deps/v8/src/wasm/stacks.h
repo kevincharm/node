@@ -9,7 +9,6 @@
 #error This header should only be included if WebAssembly is enabled.
 #endif  // !V8_ENABLE_WEBASSEMBLY
 
-#include "src/base/build_config.h"
 #include "src/common/globals.h"
 #include "src/execution/isolate.h"
 #include "src/utils/allocation.h"
@@ -43,7 +42,7 @@ class StackMemory {
   }
 
   ~StackMemory() {
-    if (FLAG_trace_wasm_stack_switching) {
+    if (v8_flags.trace_wasm_stack_switching) {
       PrintF("Delete stack #%d\n", id_);
     }
     PageAllocator* allocator = GetPlatformPageAllocator();
@@ -96,7 +95,7 @@ class StackMemory {
     limit_ = static_cast<byte*>(
         allocator->AllocatePages(nullptr, size_, allocator->AllocatePageSize(),
                                  PageAllocator::kReadWrite));
-    if (FLAG_trace_wasm_stack_switching) {
+    if (v8_flags.trace_wasm_stack_switching) {
       PrintF("Allocate stack #%d\n", id_);
     }
   }
@@ -105,7 +104,7 @@ class StackMemory {
   StackMemory(Isolate* isolate, byte* limit)
       : isolate_(isolate),
         limit_(limit),
-        size_(reinterpret_cast<size_t>(limit)),
+        size_(v8_flags.stack_size * KB),
         owned_(false) {
     id_ = 0;
   }

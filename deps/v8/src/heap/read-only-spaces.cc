@@ -9,20 +9,19 @@
 #include "include/v8-internal.h"
 #include "include/v8-platform.h"
 #include "src/base/logging.h"
+#include "src/base/macros.h"
 #include "src/common/globals.h"
 #include "src/common/ptr-compr-inl.h"
 #include "src/execution/isolate.h"
 #include "src/heap/allocation-stats.h"
 #include "src/heap/basic-memory-chunk.h"
-#include "src/heap/combined-heap.h"
 #include "src/heap/heap-inl.h"
 #include "src/heap/memory-allocator.h"
-#include "src/heap/memory-chunk.h"
 #include "src/heap/read-only-heap.h"
+#include "src/objects/heap-object.h"
 #include "src/objects/objects-inl.h"
-#include "src/objects/property-details.h"
-#include "src/objects/string.h"
-#include "src/snapshot/read-only-deserializer.h"
+#include "src/snapshot/snapshot-data.h"
+#include "src/snapshot/snapshot-utils.h"
 
 namespace v8 {
 namespace internal {
@@ -64,7 +63,7 @@ void ReadOnlyArtifacts::VerifyChecksum(SnapshotData* read_only_snapshot_data,
       // supported. As a result, it's possible that it will create a new
       // read-only snapshot that is not compatible with the original one (for
       // instance due to the string table being re-ordered). Since we won't
-      // acutally use that new Isoalte, we're ok with any potential corruption.
+      // actually use that new Isolate, we're ok with any potential corruption.
       // See crbug.com/1043058.
       CHECK_EQ(read_only_blob_checksum_, snapshot_checksum);
     }
@@ -290,7 +289,6 @@ ReadOnlySpace::ReadOnlySpace(Heap* heap)
     : BaseSpace(heap, RO_SPACE),
       top_(kNullAddress),
       limit_(kNullAddress),
-      is_string_padding_cleared_(heap->isolate()->initialized_from_snapshot()),
       capacity_(0),
       area_size_(MemoryChunkLayout::AllocatableMemoryInMemoryChunk(RO_SPACE)) {}
 
@@ -375,28 +373,9 @@ void ReadOnlySpace::RepairFreeSpacesAfterDeserialization() {
     // Put a filler object in the gap between the end of the allocated objects
     // and the end of the allocatable area.
     if (start < end) {
-      heap()->CreateFillerObjectAt(start, static_cast<int>(end - start),
-                                   ClearRecordedSlots::kNo);
+      heap()->CreateFillerObjectAt(start, static_cast<int>(end - start));
     }
   }
-}
-
-void ReadOnlySpace::ClearStringPaddingIfNeeded() {
-  if (V8_ENABLE_THIRD_PARTY_HEAP_BOOL) {
-    // TODO(v8:11641): Revisit this once third-party heap supports iteration.
-    return;
-  }
-  if (is_string_padding_cleared_) return;
-
-  ReadOnlyHeapObjectIterator iterator(this);
-  for (HeapObject o = iterator.Next(); !o.is_null(); o = iterator.Next()) {
-    if (o.IsSeqOneByteString()) {
-      SeqOneByteString::cast(o).clear_padding();
-    } else if (o.IsSeqTwoByteString()) {
-      SeqTwoByteString::cast(o).clear_padding();
-    }
-  }
-  is_string_padding_cleared_ = true;
 }
 
 void ReadOnlySpace::Seal(SealMode ro_mode) {
@@ -444,25 +423,30 @@ class ReadOnlySpaceObjectIterator : public ObjectIterator {
  public:
   ReadOnlySpaceObjectIterator(const Heap* heap, const ReadOnlySpace* space,
                               BasicMemoryChunk* chunk)
-      : cur_addr_(kNullAddress), cur_end_(kNullAddress), space_(space) {}
+      : cur_addr_(chunk->area_start()),
+        cur_end_(chunk->area_end()),
+        space_(space) {}
 
   // Advance to the next object, skipping free spaces and other fillers and
   // skipping the special garbage section of which there is one per space.
-  // Returns nullptr when the iteration has ended.
+  // Returns a null object when the iteration has ended.
   HeapObject Next() override {
-    HeapObject next_obj = FromCurrentPage();
-    if (!next_obj.is_null()) return next_obj;
-    return HeapObject();
-  }
-
- private:
-  HeapObject FromCurrentPage() {
     while (cur_addr_ != cur_end_) {
       if (cur_addr_ == space_->top() && cur_addr_ != space_->limit()) {
         cur_addr_ = space_->limit();
         continue;
       }
       HeapObject obj = HeapObject::FromAddress(cur_addr_);
+      // TODO(teodutu): Simplify checking for one pointer fillers. We cannot
+      // verifiy them directly because some of the objects here are initialised
+      // before the one pointer filler map, which leads to the wrong map being
+      // written instead.
+      if (V8_COMPRESS_POINTERS_8GB_BOOL &&
+          !IsAligned(cur_addr_, kObjectAlignment8GbHeap) &&
+          !obj.IsFreeSpace()) {
+        cur_addr_ = RoundUp<kObjectAlignment8GbHeap>(cur_addr_);
+        continue;
+      }
       const int obj_size = obj.Size();
       cur_addr_ += obj_size;
       DCHECK_LE(cur_addr_, cur_end_);
@@ -606,8 +590,7 @@ void ReadOnlySpace::FreeLinearAllocationArea() {
   heap()->incremental_marking()->marking_state()->bitmap(page)->ClearRange(
       page->AddressToMarkbitIndex(top_), page->AddressToMarkbitIndex(limit_));
 
-  heap()->CreateFillerObjectAt(top_, static_cast<int>(limit_ - top_),
-                               ClearRecordedSlots::kNo);
+  heap()->CreateFillerObjectAt(top_, static_cast<int>(limit_ - top_));
 
   BasicMemoryChunk::UpdateHighWaterMark(top_);
 
@@ -634,8 +617,7 @@ void ReadOnlySpace::EnsureSpaceForAllocation(int size_in_bytes) {
   pages_.push_back(static_cast<ReadOnlyPage*>(chunk));
 
   heap()->CreateFillerObjectAt(chunk->area_start(),
-                               static_cast<int>(chunk->area_size()),
-                               ClearRecordedSlots::kNo);
+                               static_cast<int>(chunk->area_size()));
 
   top_ = chunk->area_start();
   limit_ = chunk->area_end();
@@ -709,7 +691,8 @@ AllocationResult ReadOnlySpace::AllocateRawUnaligned(int size_in_bytes) {
 AllocationResult ReadOnlySpace::AllocateRaw(int size_in_bytes,
                                             AllocationAlignment alignment) {
   AllocationResult result =
-      USE_ALLOCATION_ALIGNMENT_BOOL && alignment != kTaggedAligned
+      V8_COMPRESS_POINTERS_8GB_BOOL ||
+              (USE_ALLOCATION_ALIGNMENT_BOOL && alignment != kTaggedAligned)
           ? AllocateRawAligned(size_in_bytes, alignment)
           : AllocateRawUnaligned(size_in_bytes);
   HeapObject heap_obj;
@@ -739,8 +722,7 @@ size_t ReadOnlyPage::ShrinkToHighWaterMark() {
     }
     heap()->CreateFillerObjectAt(
         filler.address(),
-        static_cast<int>(area_end() - filler.address() - unused),
-        ClearRecordedSlots::kNo);
+        static_cast<int>(area_end() - filler.address() - unused));
     heap()->memory_allocator()->PartialFreeMemory(
         this, address() + size() - unused, unused, area_end() - unused);
     if (filler.address() != area_end()) {
@@ -754,8 +736,7 @@ size_t ReadOnlyPage::ShrinkToHighWaterMark() {
 void ReadOnlySpace::ShrinkPages() {
   if (V8_ENABLE_THIRD_PARTY_HEAP_BOOL) return;
   BasicMemoryChunk::UpdateHighWaterMark(top_);
-  heap()->CreateFillerObjectAt(top_, static_cast<int>(limit_ - top_),
-                               ClearRecordedSlots::kNo);
+  heap()->CreateFillerObjectAt(top_, static_cast<int>(limit_ - top_));
 
   for (ReadOnlyPage* chunk : pages_) {
     DCHECK(chunk->IsFlagSet(Page::NEVER_EVACUATE));

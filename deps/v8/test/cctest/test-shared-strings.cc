@@ -4,15 +4,49 @@
 
 #include "include/v8-initialization.h"
 #include "src/base/strings.h"
+#include "src/common/globals.h"
 #include "src/heap/factory.h"
 #include "src/heap/heap-inl.h"
+#include "src/heap/memory-chunk-layout.h"
+#include "src/heap/memory-chunk.h"
+#include "src/heap/parked-scope.h"
+#include "src/heap/remembered-set.h"
+#include "src/objects/fixed-array.h"
 #include "src/objects/objects-inl.h"
+#include "src/objects/string-forwarding-table-inl.h"
 #include "test/cctest/cctest.h"
 #include "test/cctest/heap/heap-utils.h"
 
 namespace v8 {
 namespace internal {
 namespace test_shared_strings {
+
+struct V8_NODISCARD IsolateWrapper {
+  explicit IsolateWrapper(v8::Isolate* isolate) : isolate(isolate) {}
+  ~IsolateWrapper() { isolate->Dispose(); }
+  v8::Isolate* const isolate;
+};
+
+// Some tests in this file allocate two Isolates in the same thread to directly
+// test shared string behavior. Because both are considered running, when
+// disposing these Isolates, one must be parked to not cause a deadlock in the
+// shared heap verification that happens on client Isolate disposal.
+struct V8_NODISCARD IsolateParkOnDisposeWrapper {
+  IsolateParkOnDisposeWrapper(v8::Isolate* isolate,
+                              v8::Isolate* isolate_to_park)
+      : isolate(isolate), isolate_to_park(isolate_to_park) {}
+
+  ~IsolateParkOnDisposeWrapper() {
+    {
+      i::ParkedScope parked(reinterpret_cast<Isolate*>(isolate_to_park)
+                                ->main_thread_local_isolate());
+      isolate->Dispose();
+    }
+  }
+
+  v8::Isolate* const isolate;
+  v8::Isolate* const isolate_to_park;
+};
 
 class MultiClientIsolateTest {
  public:
@@ -21,46 +55,28 @@ class MultiClientIsolateTest {
         v8::ArrayBuffer::Allocator::NewDefaultAllocator());
     v8::Isolate::CreateParams create_params;
     create_params.array_buffer_allocator = allocator.get();
-    shared_isolate_ =
-        reinterpret_cast<v8::Isolate*>(Isolate::NewShared(create_params));
+    main_isolate_ = v8::Isolate::New(create_params);
   }
 
-  ~MultiClientIsolateTest() {
-    for (v8::Isolate* client_isolate : client_isolates_) {
-      client_isolate->Dispose();
-    }
-    Isolate::Delete(i_shared_isolate());
-  }
+  ~MultiClientIsolateTest() { main_isolate_->Dispose(); }
 
-  v8::Isolate* shared_isolate() const { return shared_isolate_; }
+  v8::Isolate* main_isolate() const { return main_isolate_; }
 
-  Isolate* i_shared_isolate() const {
-    return reinterpret_cast<Isolate*>(shared_isolate_);
-  }
-
-  const std::vector<v8::Isolate*>& client_isolates() const {
-    return client_isolates_;
+  Isolate* i_main_isolate() const {
+    return reinterpret_cast<Isolate*>(main_isolate_);
   }
 
   v8::Isolate* NewClientIsolate() {
-    CHECK_NOT_NULL(shared_isolate_);
+    CHECK_NOT_NULL(main_isolate_);
     std::unique_ptr<v8::ArrayBuffer::Allocator> allocator(
         v8::ArrayBuffer::Allocator::NewDefaultAllocator());
     v8::Isolate::CreateParams create_params;
     create_params.array_buffer_allocator = allocator.get();
-    create_params.experimental_attach_to_shared_isolate = shared_isolate_;
-    v8::Isolate* client = v8::Isolate::New(create_params);
-    {
-      base::MutexGuard vector_write_guard(&vector_mutex_);
-      client_isolates_.push_back(client);
-    }
-    return client;
+    return v8::Isolate::New(create_params);
   }
 
  private:
-  v8::Isolate* shared_isolate_;
-  std::vector<v8::Isolate*> client_isolates_;
-  base::Mutex vector_mutex_;
+  v8::Isolate* main_isolate_;
 };
 
 UNINITIALIZED_TEST(InPlaceInternalizableStringsAreShared) {
@@ -71,8 +87,7 @@ UNINITIALIZED_TEST(InPlaceInternalizableStringsAreShared) {
   FLAG_shared_string_table = true;
 
   MultiClientIsolateTest test;
-  v8::Isolate* isolate1 = test.NewClientIsolate();
-  Isolate* i_isolate1 = reinterpret_cast<Isolate*>(isolate1);
+  Isolate* i_isolate1 = test.i_main_isolate();
   Factory* factory1 = i_isolate1->factory();
 
   HandleScope handle_scope(i_isolate1);
@@ -101,11 +116,14 @@ UNINITIALIZED_TEST(InPlaceInternalizableStringsAreShared) {
   CHECK(!young_two_byte_seq->InSharedHeap());
 
   // Internalized strings are shared.
+  uint64_t seed = HashSeed(i_isolate1);
   Handle<String> one_byte_intern = factory1->NewOneByteInternalizedString(
-      base::OneByteVector(raw_one_byte), 1);
+      base::OneByteVector(raw_one_byte),
+      StringHasher::HashSequentialString<char>(raw_one_byte, 3, seed));
   CHECK(one_byte_intern->InSharedHeap());
-  Handle<String> two_byte_intern =
-      factory1->NewTwoByteInternalizedString(two_byte, 1);
+  Handle<String> two_byte_intern = factory1->NewTwoByteInternalizedString(
+      two_byte,
+      StringHasher::HashSequentialString<uint16_t>(raw_two_byte, 3, seed));
   CHECK(two_byte_intern->InSharedHeap());
 }
 
@@ -116,11 +134,11 @@ UNINITIALIZED_TEST(InPlaceInternalization) {
   FLAG_shared_string_table = true;
 
   MultiClientIsolateTest test;
-  v8::Isolate* isolate1 = test.NewClientIsolate();
-  v8::Isolate* isolate2 = test.NewClientIsolate();
-  Isolate* i_isolate1 = reinterpret_cast<Isolate*>(isolate1);
+  IsolateParkOnDisposeWrapper isolate_wrapper(test.NewClientIsolate(),
+                                              test.main_isolate());
+  Isolate* i_isolate1 = test.i_main_isolate();
   Factory* factory1 = i_isolate1->factory();
-  Isolate* i_isolate2 = reinterpret_cast<Isolate*>(isolate2);
+  Isolate* i_isolate2 = reinterpret_cast<Isolate*>(isolate_wrapper.isolate);
   Factory* factory2 = i_isolate2->factory();
 
   HandleScope scope1(i_isolate1);
@@ -182,11 +200,11 @@ UNINITIALIZED_TEST(YoungInternalization) {
   FLAG_shared_string_table = true;
 
   MultiClientIsolateTest test;
-  v8::Isolate* isolate1 = test.NewClientIsolate();
-  v8::Isolate* isolate2 = test.NewClientIsolate();
-  Isolate* i_isolate1 = reinterpret_cast<Isolate*>(isolate1);
+  IsolateParkOnDisposeWrapper isolate_wrapper(test.NewClientIsolate(),
+                                              test.main_isolate());
+  Isolate* i_isolate1 = test.i_main_isolate();
   Factory* factory1 = i_isolate1->factory();
-  Isolate* i_isolate2 = reinterpret_cast<Isolate*>(isolate2);
+  Isolate* i_isolate2 = reinterpret_cast<Isolate*>(isolate_wrapper.isolate);
   Factory* factory2 = i_isolate2->factory();
 
   HandleScope scope1(i_isolate1);
@@ -239,10 +257,10 @@ class ConcurrentStringThreadBase : public v8::base::Thread {
  public:
   ConcurrentStringThreadBase(const char* name, MultiClientIsolateTest* test,
                              Handle<FixedArray> shared_strings,
-                             base::Semaphore* sema_ready,
-                             base::Semaphore* sema_execute_start,
-                             base::Semaphore* sema_execute_complete)
-      : v8::base::Thread(base::Thread::Options(name)),  // typeid(this).name?
+                             ParkingSemaphore* sema_ready,
+                             ParkingSemaphore* sema_execute_start,
+                             ParkingSemaphore* sema_execute_complete)
+      : v8::base::Thread(base::Thread::Options(name)),
         test_(test),
         shared_strings_(shared_strings),
         sema_ready_(sema_ready),
@@ -253,34 +271,44 @@ class ConcurrentStringThreadBase : public v8::base::Thread {
   virtual void RunForString(Handle<String> string) = 0;
   virtual void Teardown() {}
   void Run() override {
-    isolate = test_->NewClientIsolate();
-    i_isolate = reinterpret_cast<Isolate*>(isolate);
+    IsolateWrapper isolate_wrapper(test_->NewClientIsolate());
+    i_isolate = reinterpret_cast<Isolate*>(isolate_wrapper.isolate);
 
     Setup();
 
     sema_ready_->Signal();
-    sema_execute_start_->Wait();
+    sema_execute_start_->ParkedWait(i_isolate->main_thread_local_isolate());
 
-    HandleScope scope(i_isolate);
-    for (int i = 0; i < shared_strings_->length(); i++) {
-      Handle<String> input_string(String::cast(shared_strings_->get(i)),
-                                  i_isolate);
-      RunForString(input_string);
+    {
+      HandleScope scope(i_isolate);
+      for (int i = 0; i < shared_strings_->length(); i++) {
+        Handle<String> input_string(String::cast(shared_strings_->get(i)),
+                                    i_isolate);
+        RunForString(input_string);
+      }
     }
 
     sema_execute_complete_->Signal();
 
     Teardown();
+
+    i_isolate = nullptr;
+  }
+
+  void ParkedJoin(const ParkedScope& scope) {
+    USE(scope);
+    Join();
   }
 
  protected:
-  v8::Isolate* isolate;
+  using base::Thread::Join;
+
   Isolate* i_isolate;
   MultiClientIsolateTest* test_;
   Handle<FixedArray> shared_strings_;
-  base::Semaphore* sema_ready_;
-  base::Semaphore* sema_execute_start_;
-  base::Semaphore* sema_execute_complete_;
+  ParkingSemaphore* sema_ready_;
+  ParkingSemaphore* sema_execute_start_;
+  ParkingSemaphore* sema_execute_complete_;
 };
 
 enum TestHitOrMiss { kTestMiss, kTestHit };
@@ -291,9 +319,9 @@ class ConcurrentInternalizationThread final
   ConcurrentInternalizationThread(MultiClientIsolateTest* test,
                                   Handle<FixedArray> shared_strings,
                                   TestHitOrMiss hit_or_miss,
-                                  base::Semaphore* sema_ready,
-                                  base::Semaphore* sema_execute_start,
-                                  base::Semaphore* sema_execute_complete)
+                                  ParkingSemaphore* sema_ready,
+                                  ParkingSemaphore* sema_execute_start,
+                                  ParkingSemaphore* sema_execute_complete)
       : ConcurrentStringThreadBase("ConcurrentInternalizationThread", test,
                                    shared_strings, sema_ready,
                                    sema_execute_start, sema_execute_complete),
@@ -305,15 +333,11 @@ class ConcurrentInternalizationThread final
     CHECK(input_string->IsShared());
     Handle<String> interned = factory->InternalizeString(input_string);
     CHECK(interned->IsShared());
+    CHECK(interned->IsInternalizedString());
     if (hit_or_miss_ == kTestMiss) {
       CHECK_EQ(*input_string, *interned);
     } else {
-      // TODO(v8:12007): In-place internalization currently do not migrate
-      // shared strings to ThinStrings. This is triviailly threadsafe for
-      // character access but bad for performance, as run-time
-      // internalizations do not speed up comparisons for shared strings.
-      CHECK(!input_string->IsThinString());
-      CHECK_NE(*input_string, *interned);
+      CHECK(input_string->HasForwardingIndex(kAcquireLoad));
       CHECK(String::Equals(i_isolate, input_string, interned));
     }
   }
@@ -358,13 +382,11 @@ void TestConcurrentInternalization(TestHitOrMiss hit_or_miss) {
 
   FLAG_shared_string_table = true;
 
-  MultiClientIsolateTest test;
-
   constexpr int kThreads = 4;
   constexpr int kStrings = 4096;
 
-  v8::Isolate* isolate = test.NewClientIsolate();
-  Isolate* i_isolate = reinterpret_cast<Isolate*>(isolate);
+  MultiClientIsolateTest test;
+  Isolate* i_isolate = test.i_main_isolate();
   Factory* factory = i_isolate->factory();
 
   HandleScope scope(i_isolate);
@@ -372,9 +394,9 @@ void TestConcurrentInternalization(TestHitOrMiss hit_or_miss) {
   Handle<FixedArray> shared_strings = CreateSharedOneByteStrings(
       i_isolate, factory, kStrings, hit_or_miss == kTestHit);
 
-  base::Semaphore sema_ready(0);
-  base::Semaphore sema_execute_start(0);
-  base::Semaphore sema_execute_complete(0);
+  ParkingSemaphore sema_ready(0);
+  ParkingSemaphore sema_execute_start(0);
+  ParkingSemaphore sema_execute_complete(0);
   std::vector<std::unique_ptr<ConcurrentInternalizationThread>> threads;
   for (int i = 0; i < kThreads; i++) {
     auto thread = std::make_unique<ConcurrentInternalizationThread>(
@@ -384,12 +406,20 @@ void TestConcurrentInternalization(TestHitOrMiss hit_or_miss) {
     threads.push_back(std::move(thread));
   }
 
-  for (int i = 0; i < kThreads; i++) sema_ready.Wait();
-  for (int i = 0; i < kThreads; i++) sema_execute_start.Signal();
-  for (int i = 0; i < kThreads; i++) sema_execute_complete.Wait();
+  LocalIsolate* local_isolate = i_isolate->main_thread_local_isolate();
+  for (int i = 0; i < kThreads; i++) {
+    sema_ready.ParkedWait(local_isolate);
+  }
+  for (int i = 0; i < kThreads; i++) {
+    sema_execute_start.Signal();
+  }
+  for (int i = 0; i < kThreads; i++) {
+    sema_execute_complete.ParkedWait(local_isolate);
+  }
 
+  ParkedScope parked(local_isolate);
   for (auto& thread : threads) {
-    thread->Join();
+    thread->ParkedJoin(parked);
   }
 }
 }  // namespace
@@ -407,9 +437,9 @@ class ConcurrentStringTableLookupThread final
  public:
   ConcurrentStringTableLookupThread(MultiClientIsolateTest* test,
                                     Handle<FixedArray> shared_strings,
-                                    base::Semaphore* sema_ready,
-                                    base::Semaphore* sema_execute_start,
-                                    base::Semaphore* sema_execute_complete)
+                                    ParkingSemaphore* sema_ready,
+                                    ParkingSemaphore* sema_execute_start,
+                                    ParkingSemaphore* sema_execute_complete)
       : ConcurrentStringThreadBase("ConcurrentStringTableLookup", test,
                                    shared_strings, sema_ready,
                                    sema_execute_start, sema_execute_complete) {}
@@ -435,14 +465,12 @@ UNINITIALIZED_TEST(ConcurrentStringTableLookup) {
 
   FLAG_shared_string_table = true;
 
-  MultiClientIsolateTest test;
-
   constexpr int kTotalThreads = 4;
   constexpr int kInternalizationThreads = 1;
   constexpr int kStrings = 4096;
 
-  v8::Isolate* isolate = test.NewClientIsolate();
-  Isolate* i_isolate = reinterpret_cast<Isolate*>(isolate);
+  MultiClientIsolateTest test;
+  Isolate* i_isolate = test.i_main_isolate();
   Factory* factory = i_isolate->factory();
 
   HandleScope scope(i_isolate);
@@ -450,10 +478,10 @@ UNINITIALIZED_TEST(ConcurrentStringTableLookup) {
   Handle<FixedArray> shared_strings =
       CreateSharedOneByteStrings(i_isolate, factory, kStrings, false);
 
-  base::Semaphore sema_ready(0);
-  base::Semaphore sema_execute_start(0);
-  base::Semaphore sema_execute_complete(0);
-  std::vector<std::unique_ptr<v8::base::Thread>> threads;
+  ParkingSemaphore sema_ready(0);
+  ParkingSemaphore sema_execute_start(0);
+  ParkingSemaphore sema_execute_complete(0);
+  std::vector<std::unique_ptr<ConcurrentStringThreadBase>> threads;
   for (int i = 0; i < kInternalizationThreads; i++) {
     auto thread = std::make_unique<ConcurrentInternalizationThread>(
         &test, shared_strings, kTestMiss, &sema_ready, &sema_execute_start,
@@ -469,12 +497,20 @@ UNINITIALIZED_TEST(ConcurrentStringTableLookup) {
     threads.push_back(std::move(thread));
   }
 
-  for (int i = 0; i < kTotalThreads; i++) sema_ready.Wait();
-  for (int i = 0; i < kTotalThreads; i++) sema_execute_start.Signal();
-  for (int i = 0; i < kTotalThreads; i++) sema_execute_complete.Wait();
+  LocalIsolate* local_isolate = i_isolate->main_thread_local_isolate();
+  for (int i = 0; i < kTotalThreads; i++) {
+    sema_ready.ParkedWait(local_isolate);
+  }
+  for (int i = 0; i < kTotalThreads; i++) {
+    sema_execute_start.Signal();
+  }
+  for (int i = 0; i < kTotalThreads; i++) {
+    sema_execute_complete.ParkedWait(local_isolate);
+  }
 
+  ParkedScope parked(local_isolate);
   for (auto& thread : threads) {
-    thread->Join();
+    thread->ParkedJoin(parked);
   }
 }
 
@@ -504,8 +540,7 @@ UNINITIALIZED_TEST(StringShare) {
   FLAG_shared_string_table = true;
 
   MultiClientIsolateTest test;
-  v8::Isolate* isolate = test.NewClientIsolate();
-  Isolate* i_isolate = reinterpret_cast<Isolate*>(isolate);
+  Isolate* i_isolate = test.i_main_isolate();
   Factory* factory = i_isolate->factory();
 
   HandleScope scope(i_isolate);
@@ -575,7 +610,7 @@ UNINITIALIZED_TEST(StringShare) {
     CheckSharedStringIsEqualCopy(shared_two_byte, young_two_byte_seq);
   }
 
-  {
+  if (!FLAG_always_use_string_forwarding_table) {
     // Thin strings
     Handle<String> one_byte_seq1 =
         factory->NewStringFromAsciiChecked(raw_one_byte);
@@ -627,10 +662,10 @@ UNINITIALIZED_TEST(PromotionMarkCompact) {
 
   FLAG_stress_concurrent_allocation = false;  // For SealCurrentObjects.
   FLAG_shared_string_table = true;
+  FLAG_manual_evacuation_candidates_selection = true;
 
   MultiClientIsolateTest test;
-  v8::Isolate* isolate = test.NewClientIsolate();
-  Isolate* i_isolate = reinterpret_cast<Isolate*>(isolate);
+  Isolate* i_isolate = test.i_main_isolate();
   Factory* factory = i_isolate->factory();
   Heap* heap = i_isolate->heap();
   // Heap* shared_heap = test.i_shared_isolate()->heap();
@@ -649,10 +684,13 @@ UNINITIALIZED_TEST(PromotionMarkCompact) {
     CHECK(String::IsInPlaceInternalizable(*one_byte_seq));
     CHECK(heap->InSpace(*one_byte_seq, NEW_SPACE));
 
-    for (int i = 0; i < 2; i++) {
-      heap->CollectAllGarbage(Heap::kNoGCFlags,
-                              GarbageCollectionReason::kTesting);
-    }
+    // 1st GC moves `one_byte_seq` to old space and 2nd GC evacuates it within
+    // old space.
+    heap->CollectAllGarbage(Heap::kNoGCFlags,
+                            GarbageCollectionReason::kTesting);
+    heap::ForceEvacuationCandidate(i::Page::FromHeapObject(*one_byte_seq));
+    heap->CollectAllGarbage(Heap::kNoGCFlags,
+                            GarbageCollectionReason::kTesting);
 
     // In-place-internalizable strings are promoted into the shared heap when
     // sharing.
@@ -662,6 +700,7 @@ UNINITIALIZED_TEST(PromotionMarkCompact) {
 }
 
 UNINITIALIZED_TEST(PromotionScavenge) {
+  if (FLAG_minor_mc) return;
   if (FLAG_single_generation) return;
   if (!ReadOnlyHeap::IsReadOnlySpaceShared()) return;
   if (!COMPRESS_POINTERS_IN_SHARED_CAGE_BOOL) return;
@@ -670,8 +709,7 @@ UNINITIALIZED_TEST(PromotionScavenge) {
   FLAG_shared_string_table = true;
 
   MultiClientIsolateTest test;
-  v8::Isolate* isolate = test.NewClientIsolate();
-  Isolate* i_isolate = reinterpret_cast<Isolate*>(isolate);
+  Isolate* i_isolate = test.i_main_isolate();
   Factory* factory = i_isolate->factory();
   Heap* heap = i_isolate->heap();
   // Heap* shared_heap = test.i_shared_isolate()->heap();
@@ -698,6 +736,150 @@ UNINITIALIZED_TEST(PromotionScavenge) {
     // sharing.
     CHECK(!heap->Contains(*one_byte_seq));
     CHECK(heap->SharedHeapContains(*one_byte_seq));
+  }
+}
+
+UNINITIALIZED_TEST(PromotionScavengeOldToShared) {
+  if (FLAG_single_generation) return;
+  if (!ReadOnlyHeap::IsReadOnlySpaceShared()) return;
+  if (!COMPRESS_POINTERS_IN_SHARED_CAGE_BOOL) return;
+  if (FLAG_stress_concurrent_allocation) return;
+
+  FLAG_shared_string_table = true;
+
+  MultiClientIsolateTest test;
+  Isolate* i_isolate = test.i_main_isolate();
+  Factory* factory = i_isolate->factory();
+  Heap* heap = i_isolate->heap();
+  ManualGCScope manual_gc(i_isolate);
+
+  const char raw_one_byte[] = "foo";
+
+  {
+    HandleScope scope(i_isolate);
+
+    Handle<FixedArray> old_object =
+        factory->NewFixedArray(1, AllocationType::kOld);
+    MemoryChunk* old_object_chunk = MemoryChunk::FromHeapObject(*old_object);
+    CHECK(!old_object_chunk->InYoungGeneration());
+
+    Handle<String> one_byte_seq = factory->NewStringFromAsciiChecked(
+        raw_one_byte, AllocationType::kYoung);
+    CHECK(String::IsInPlaceInternalizable(*one_byte_seq));
+    CHECK(MemoryChunk::FromHeapObject(*one_byte_seq)->InYoungGeneration());
+
+    old_object->set(0, *one_byte_seq);
+    ObjectSlot slot = old_object->GetFirstElementAddress();
+    CHECK(
+        RememberedSet<OLD_TO_NEW>::Contains(old_object_chunk, slot.address()));
+
+    for (int i = 0; i < 2; i++) {
+      heap->CollectGarbage(NEW_SPACE, GarbageCollectionReason::kTesting);
+    }
+
+    // In-place-internalizable strings are promoted into the shared heap when
+    // sharing.
+    CHECK(!heap->Contains(*one_byte_seq));
+    CHECK(heap->SharedHeapContains(*one_byte_seq));
+
+    // Since the GC promoted that string into shared heap, it also needs to
+    // create an OLD_TO_SHARED slot.
+    CHECK(RememberedSet<OLD_TO_SHARED>::Contains(old_object_chunk,
+                                                 slot.address()));
+  }
+}
+
+UNINITIALIZED_TEST(PromotionMarkCompactOldToShared) {
+  if (FLAG_single_generation) return;
+  if (!ReadOnlyHeap::IsReadOnlySpaceShared()) return;
+  if (!COMPRESS_POINTERS_IN_SHARED_CAGE_BOOL) return;
+  if (FLAG_stress_concurrent_allocation) return;
+
+  FLAG_shared_string_table = true;
+  FLAG_manual_evacuation_candidates_selection = true;
+
+  MultiClientIsolateTest test;
+  Isolate* i_isolate = test.i_main_isolate();
+  Factory* factory = i_isolate->factory();
+  Heap* heap = i_isolate->heap();
+  ManualGCScope manual_gc(i_isolate);
+
+  const char raw_one_byte[] = "foo";
+
+  {
+    HandleScope scope(i_isolate);
+
+    Handle<FixedArray> old_object =
+        factory->NewFixedArray(1, AllocationType::kOld);
+    MemoryChunk* old_object_chunk = MemoryChunk::FromHeapObject(*old_object);
+    CHECK(!old_object_chunk->InYoungGeneration());
+
+    Handle<String> one_byte_seq = factory->NewStringFromAsciiChecked(
+        raw_one_byte, AllocationType::kYoung);
+    CHECK(String::IsInPlaceInternalizable(*one_byte_seq));
+    CHECK(MemoryChunk::FromHeapObject(*one_byte_seq)->InYoungGeneration());
+
+    old_object->set(0, *one_byte_seq);
+    ObjectSlot slot = old_object->GetFirstElementAddress();
+    CHECK(
+        RememberedSet<OLD_TO_NEW>::Contains(old_object_chunk, slot.address()));
+
+    heap->CollectGarbage(OLD_SPACE, GarbageCollectionReason::kTesting);
+
+    // In-place-internalizable strings are promoted into the shared heap when
+    // sharing.
+    CHECK(!heap->Contains(*one_byte_seq));
+    CHECK(heap->SharedHeapContains(*one_byte_seq));
+
+    // Since the GC promoted that string into shared heap, it also needs to
+    // create an OLD_TO_SHARED slot.
+    CHECK(RememberedSet<OLD_TO_SHARED>::Contains(old_object_chunk,
+                                                 slot.address()));
+  }
+}
+
+UNINITIALIZED_TEST(SharedStringsTransitionDuringGC) {
+  if (!ReadOnlyHeap::IsReadOnlySpaceShared()) return;
+  if (!COMPRESS_POINTERS_IN_SHARED_CAGE_BOOL) return;
+
+  FLAG_shared_string_table = true;
+
+  constexpr int kStrings = 4096;
+
+  MultiClientIsolateTest test;
+  Isolate* i_isolate = test.i_main_isolate();
+  Factory* factory = i_isolate->factory();
+
+  HandleScope scope(i_isolate);
+
+  // Run two times to test that everything is reset correctly during GC.
+  for (int run = 0; run < 2; run++) {
+    Handle<FixedArray> shared_strings =
+        CreateSharedOneByteStrings(i_isolate, factory, kStrings, run == 0);
+
+    // Check strings are in the forwarding table after internalization.
+    for (int i = 0; i < shared_strings->length(); i++) {
+      Handle<String> input_string(String::cast(shared_strings->get(i)),
+                                  i_isolate);
+      Handle<String> interned = factory->InternalizeString(input_string);
+      CHECK(input_string->IsShared());
+      CHECK(!input_string->IsThinString());
+      CHECK(input_string->HasForwardingIndex(kAcquireLoad));
+      CHECK(String::Equals(i_isolate, input_string, interned));
+    }
+
+    // Trigger garbage collection on the shared isolate.
+    i_isolate->heap()->CollectSharedGarbage(GarbageCollectionReason::kTesting);
+
+    // Check that GC cleared the forwarding table.
+    CHECK_EQ(i_isolate->string_forwarding_table()->size(), 0);
+
+    // Check all strings are transitioned to ThinStrings
+    for (int i = 0; i < shared_strings->length(); i++) {
+      Handle<String> input_string(String::cast(shared_strings->get(i)),
+                                  i_isolate);
+      CHECK(input_string->IsThinString());
+    }
   }
 }
 

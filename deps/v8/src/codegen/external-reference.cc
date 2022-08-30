@@ -29,6 +29,7 @@
 #include "src/objects/object-type.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/ordered-hash-table.h"
+#include "src/objects/simd.h"
 #include "src/regexp/experimental/experimental.h"
 #include "src/regexp/regexp-interpreter.h"
 #include "src/regexp/regexp-macro-assembler-arch.h"
@@ -219,7 +220,7 @@ ExternalReference ExternalReference::handle_scope_implementer_address(
   return ExternalReference(isolate->handle_scope_implementer_address());
 }
 
-#ifdef V8_SANDBOXED_POINTERS
+#ifdef V8_ENABLE_SANDBOX
 ExternalReference ExternalReference::sandbox_base_address() {
   return ExternalReference(GetProcessWideSandbox()->base_address());
 }
@@ -233,14 +234,19 @@ ExternalReference ExternalReference::empty_backing_store_buffer() {
                                ->constants()
                                .empty_backing_store_buffer_address());
 }
-#endif  // V8_SANDBOXED_POINTERS
 
-#ifdef V8_SANDBOXED_EXTERNAL_POINTERS
 ExternalReference ExternalReference::external_pointer_table_address(
     Isolate* isolate) {
   return ExternalReference(isolate->external_pointer_table_address());
 }
-#endif  // V8_SANDBOXED_EXTERNAL_POINTERS
+
+ExternalReference
+ExternalReference::shared_external_pointer_table_address_address(
+    Isolate* isolate) {
+  return ExternalReference(
+      isolate->shared_external_pointer_table_address_address());
+}
+#endif  // V8_ENABLE_SANDBOX
 
 ExternalReference ExternalReference::interpreter_dispatch_table_address(
     Isolate* isolate) {
@@ -319,18 +325,21 @@ struct IsValidExternalReferenceType<Result (Class::*)(Args...)> {
 
 #define FUNCTION_REFERENCE(Name, Target)                                   \
   ExternalReference ExternalReference::Name() {                            \
-    STATIC_ASSERT(IsValidExternalReferenceType<decltype(&Target)>::value); \
+    static_assert(IsValidExternalReferenceType<decltype(&Target)>::value); \
     return ExternalReference(Redirect(FUNCTION_ADDR(Target)));             \
   }
 
 #define FUNCTION_REFERENCE_WITH_TYPE(Name, Target, Type)                   \
   ExternalReference ExternalReference::Name() {                            \
-    STATIC_ASSERT(IsValidExternalReferenceType<decltype(&Target)>::value); \
+    static_assert(IsValidExternalReferenceType<decltype(&Target)>::value); \
     return ExternalReference(Redirect(FUNCTION_ADDR(Target), Type));       \
   }
 
 FUNCTION_REFERENCE(write_barrier_marking_from_code_function,
                    WriteBarrier::MarkingFromCode)
+
+FUNCTION_REFERENCE(shared_barrier_from_code_function,
+                   WriteBarrier::SharedFromCode)
 
 FUNCTION_REFERENCE(insert_remembered_set_function,
                    Heap::InsertIntoRememberedSetFromCode)
@@ -355,11 +364,20 @@ ExternalReference::runtime_function_table_address_for_unittests(
 }
 
 // static
-Address ExternalReference::Redirect(Address address, Type type) {
+Address ExternalReference::Redirect(Address external_function, Type type) {
 #ifdef USE_SIMULATOR
-  return SimulatorBase::RedirectExternalReference(address, type);
+  return SimulatorBase::RedirectExternalReference(external_function, type);
 #else
-  return address;
+  return external_function;
+#endif
+}
+
+// static
+Address ExternalReference::UnwrapRedirection(Address redirection_trampoline) {
+#ifdef USE_SIMULATOR
+  return SimulatorBase::UnwrapRedirection(redirection_trampoline);
+#else
+  return redirection_trampoline;
 #endif
 }
 
@@ -437,6 +455,8 @@ IF_WASM(FUNCTION_REFERENCE, wasm_float64_pow, wasm::float64_pow_wrapper)
 IF_WASM(FUNCTION_REFERENCE, wasm_call_trap_callback_for_testing,
         wasm::call_trap_callback_for_testing)
 IF_WASM(FUNCTION_REFERENCE, wasm_array_copy, wasm::array_copy_wrapper)
+IF_WASM(FUNCTION_REFERENCE, wasm_array_fill_with_zeroes,
+        wasm::array_fill_with_zeroes_wrapper)
 
 static void f64_acos_wrapper(Address data) {
   double input = ReadUnalignedValue<double>(data);
@@ -487,6 +507,11 @@ ExternalReference ExternalReference::address_of_real_jslimit(Isolate* isolate) {
 ExternalReference ExternalReference::heap_is_marking_flag_address(
     Isolate* isolate) {
   return ExternalReference(isolate->heap()->IsMarkingFlagAddress());
+}
+
+ExternalReference ExternalReference::heap_is_minor_marking_flag_address(
+    Isolate* isolate) {
+  return ExternalReference(isolate->heap()->IsMinorMarkingFlagAddress());
 }
 
 ExternalReference ExternalReference::new_space_allocation_top_address(
@@ -548,6 +573,12 @@ ExternalReference ExternalReference::address_of_min_int() {
 ExternalReference
 ExternalReference::address_of_mock_arraybuffer_allocator_flag() {
   return ExternalReference(&FLAG_mock_arraybuffer_allocator);
+}
+
+// TODO(jgruber): Update the other extrefs pointing at FLAG_ addresses to be
+// called address_of_FLAG_foo (easier grep-ability).
+ExternalReference ExternalReference::address_of_FLAG_trace_osr() {
+  return ExternalReference(&FLAG_trace_osr);
 }
 
 ExternalReference ExternalReference::address_of_builtin_subclassing_flag() {
@@ -707,10 +738,6 @@ ExternalReference ExternalReference::thread_in_wasm_flag_address_address(
   return ExternalReference(isolate->thread_in_wasm_flag_address_address());
 }
 
-ExternalReference ExternalReference::is_profiling_address(Isolate* isolate) {
-  return ExternalReference(isolate->is_profiling_address());
-}
-
 ExternalReference ExternalReference::invoke_function_callback() {
   Address thunk_address = FUNCTION_ADDR(&InvokeFunctionCallback);
   ExternalReference::Type thunk_type = ExternalReference::PROFILING_API_CALL;
@@ -743,7 +770,7 @@ ExternalReference ExternalReference::invoke_accessor_getter_callback() {
 #define re_stack_check_func RegExpMacroAssemblerLOONG64::CheckStackGuardState
 #elif V8_TARGET_ARCH_S390
 #define re_stack_check_func RegExpMacroAssemblerS390::CheckStackGuardState
-#elif V8_TARGET_ARCH_RISCV64
+#elif V8_TARGET_ARCH_RISCV32 || V8_TARGET_ARCH_RISCV64
 #define re_stack_check_func RegExpMacroAssemblerRISCV::CheckStackGuardState
 #else
 UNREACHABLE();
@@ -991,7 +1018,12 @@ FUNCTION_REFERENCE(copy_typed_array_elements_to_typed_array,
 FUNCTION_REFERENCE(copy_typed_array_elements_slice, CopyTypedArrayElementsSlice)
 FUNCTION_REFERENCE(try_string_to_index_or_lookup_existing,
                    StringTable::TryStringToIndexOrLookupExisting)
+FUNCTION_REFERENCE(string_from_forward_table,
+                   StringForwardingTable::GetForwardStringAddress)
 FUNCTION_REFERENCE(string_to_array_index_function, String::ToArrayIndex)
+FUNCTION_REFERENCE(array_indexof_includes_smi_or_object,
+                   ArrayIndexOfIncludesSmiOrObject)
+FUNCTION_REFERENCE(array_indexof_includes_double, ArrayIndexOfIncludesDouble)
 
 static Address LexicographicCompareWrapper(Isolate* isolate, Address smi_x,
                                            Address smi_y) {
@@ -1011,6 +1043,21 @@ FUNCTION_REFERENCE(mutable_big_int_absolute_compare_function,
 
 FUNCTION_REFERENCE(mutable_big_int_absolute_sub_and_canonicalize_function,
                    MutableBigInt_AbsoluteSubAndCanonicalize)
+
+FUNCTION_REFERENCE(mutable_big_int_absolute_mul_and_canonicalize_function,
+                   MutableBigInt_AbsoluteMulAndCanonicalize)
+
+FUNCTION_REFERENCE(mutable_big_int_absolute_div_and_canonicalize_function,
+                   MutableBigInt_AbsoluteDivAndCanonicalize)
+
+FUNCTION_REFERENCE(mutable_big_int_bitwise_and_pp_and_canonicalize_function,
+                   MutableBigInt_BitwiseAndPosPosAndCanonicalize)
+
+FUNCTION_REFERENCE(mutable_big_int_bitwise_and_nn_and_canonicalize_function,
+                   MutableBigInt_BitwiseAndNegNegAndCanonicalize)
+
+FUNCTION_REFERENCE(mutable_big_int_bitwise_and_pn_and_canonicalize_function,
+                   MutableBigInt_BitwiseAndPosNegAndCanonicalize)
 
 FUNCTION_REFERENCE(check_object_type, CheckObjectType)
 
@@ -1133,6 +1180,10 @@ ExternalReference ExternalReference::stack_is_iterable_address(
     Isolate* isolate) {
   return ExternalReference(
       isolate->isolate_data()->stack_is_iterable_address());
+}
+
+ExternalReference ExternalReference::is_profiling_address(Isolate* isolate) {
+  return ExternalReference(isolate->isolate_data()->is_profiling_address());
 }
 
 FUNCTION_REFERENCE(call_enqueue_microtask_function,
@@ -1378,11 +1429,6 @@ FUNCTION_REFERENCE(call_enter_context_function, EnterMicrotaskContextWrapper)
 FUNCTION_REFERENCE(
     js_finalization_registry_remove_cell_from_unregister_token_map,
     JSFinalizationRegistry::RemoveCellFromUnregisterTokenMap)
-
-#ifdef V8_SANDBOXED_EXTERNAL_POINTERS
-FUNCTION_REFERENCE(external_pointer_table_allocate_entry,
-                   ExternalPointerTable::AllocateEntry)
-#endif
 
 bool operator==(ExternalReference lhs, ExternalReference rhs) {
   return lhs.address() == rhs.address();

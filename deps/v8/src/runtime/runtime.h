@@ -9,13 +9,10 @@
 
 #include "include/v8-maybe.h"
 #include "src/base/bit-field.h"
-#include "src/base/platform/time.h"
 #include "src/common/globals.h"
 #include "src/handles/handles.h"
-#include "src/objects/elements-kind.h"
 #include "src/strings/unicode.h"
 #include "src/utils/allocation.h"
-#include "src/zone/zone.h"
 
 namespace v8 {
 namespace internal {
@@ -66,9 +63,10 @@ namespace internal {
   F(AtomicsSub, 3, 1)                                  \
   F(AtomicsXor, 3, 1)                                  \
   F(SetAllowAtomicsWait, 1, 1)                         \
-  F(AtomicsLoadSharedStructField, 2, 1)                \
-  F(AtomicsStoreSharedStructField, 3, 1)               \
-  F(AtomicsExchangeSharedStructField, 3, 1)
+  F(AtomicsLoadSharedStructOrArray, 2, 1)              \
+  F(AtomicsStoreSharedStructOrArray, 3, 1)             \
+  F(AtomicsExchangeSharedStructOrArray, 3, 1)          \
+  F(AtomicsConditionNumWaitersForTesting, 1, 1)
 
 #define FOR_EACH_INTRINSIC_BIGINT(F, I) \
   F(BigIntBinaryOp, 3, 1)               \
@@ -108,12 +106,10 @@ namespace internal {
 
 #define FOR_EACH_INTRINSIC_COMPILER(F, I) \
   F(CompileOptimizedOSR, 0, 1)            \
+  F(TraceOptimizedOSREntry, 0, 1)         \
   F(CompileLazy, 1, 1)                    \
   F(CompileBaseline, 1, 1)                \
-  F(CompileMaglev_Concurrent, 1, 1)       \
-  F(CompileMaglev_Synchronous, 1, 1)      \
-  F(CompileTurbofan_Concurrent, 1, 1)     \
-  F(CompileTurbofan_Synchronous, 1, 1)    \
+  F(CompileOptimized, 1, 1)               \
   F(InstallBaselineCode, 1, 1)            \
   F(HealOptimizedCodeSlot, 1, 1)          \
   F(InstantiateAsmJs, 4, 1)               \
@@ -223,6 +219,7 @@ namespace internal {
   F(FatalProcessOutOfMemoryInAllocateRaw, 0, 1)      \
   F(FatalProcessOutOfMemoryInvalidArrayLength, 0, 1) \
   F(GetAndResetRuntimeCallStats, -1 /* <= 2 */, 1)   \
+  F(GetAndResetTurboProfilingData, 0, 1)             \
   F(GetTemplateObject, 3, 1)                         \
   F(IncrementUseCounter, 1, 1)                       \
   F(BytecodeBudgetInterrupt, 1, 1)                   \
@@ -264,6 +261,7 @@ namespace internal {
   F(ThrowThrowMethodMissing, 0, 1)                   \
   F(ThrowTypeError, -1 /* >= 1 */, 1)                \
   F(ThrowTypeErrorIfStrict, -1 /* >= 1 */, 1)        \
+  F(TerminateExecution, 0, 1)                        \
   F(Typeof, 1, 1)                                    \
   F(UnwindAndFindExceptionHandler, 0, 1)
 
@@ -277,7 +275,8 @@ namespace internal {
 #define FOR_EACH_INTRINSIC_MODULE(F, I)    \
   F(DynamicImportCall, -1 /* [2, 3] */, 1) \
   I(GetImportMetaObject, 0, 1)             \
-  F(GetModuleNamespace, 1, 1)
+  F(GetModuleNamespace, 1, 1)              \
+  F(GetModuleNamespaceExport, 2, 1)
 
 #define FOR_EACH_INTRINSIC_NUMBERS(F, I) \
   F(ArrayBufferMaxByteLength, 0, 1)      \
@@ -440,7 +439,8 @@ namespace internal {
   F(ThrowConstAssignError, 0, 1)
 
 #define FOR_EACH_INTRINSIC_SHADOW_REALM(F, I) \
-  F(ShadowRealmWrappedFunctionCreate, 2, 1)
+  F(ShadowRealmWrappedFunctionCreate, 2, 1)   \
+  F(ShadowRealmImportValue, 1, 1)
 
 #define FOR_EACH_INTRINSIC_STRINGS(F, I)  \
   F(FlattenString, 1, 1)                  \
@@ -468,11 +468,17 @@ namespace internal {
   F(SymbolDescriptiveString, 1, 1)         \
   F(SymbolIsPrivate, 1, 1)
 
+#define FOR_EACH_INTRINSIC_TEMPORAL(F, I) \
+  F(IsInvalidTemporalCalendarField, 2, 1)
+
 #define FOR_EACH_INTRINSIC_TEST(F, I)         \
   F(Abort, 1, 1)                              \
   F(AbortCSADcheck, 1, 1)                     \
   F(AbortJS, 1, 1)                            \
+  F(ActiveTierIsIgnition, 1, 1)               \
+  F(ActiveTierIsSparkplug, 1, 1)              \
   F(ActiveTierIsMaglev, 1, 1)                 \
+  F(ActiveTierIsTurbofan, 1, 1)               \
   F(ArrayIteratorProtector, 0, 1)             \
   F(ArraySpeciesProtector, 0, 1)              \
   F(BaselineOsr, -1, 1)                       \
@@ -482,7 +488,9 @@ namespace internal {
   F(CompleteInobjectSlackTracking, 1, 1)      \
   F(ConstructConsString, 2, 1)                \
   F(ConstructDouble, 2, 1)                    \
+  F(ConstructInternalizedString, 1, 1)        \
   F(ConstructSlicedString, 2, 1)              \
+  F(ConstructThinString, 1, 1)                \
   F(DebugPrint, 1, 1)                         \
   F(DebugPrintPtr, 1, 1)                      \
   F(DebugTrace, 0, 1)                         \
@@ -533,8 +541,13 @@ namespace internal {
   F(IsConcatSpreadableProtector, 0, 1)        \
   F(IsConcurrentRecompilationSupported, 0, 1) \
   F(IsDictPropertyConstTrackingEnabled, 0, 1) \
+  F(IsInPlaceInternalizableString, 1, 1)      \
+  F(IsInternalizedString, 1, 1)               \
+  F(IsMaglevEnabled, 0, 1)                    \
   F(IsSameHeapObject, 2, 1)                   \
   F(IsSharedString, 1, 1)                     \
+  F(IsSparkplugEnabled, 0, 1)                 \
+  F(IsTurbofanEnabled, 0, 1)                  \
   F(MapIteratorProtector, 0, 1)               \
   F(NeverOptimizeFunction, 1, 1)              \
   F(NewRegExpWithBacktrackLimit, 3, 1)        \
@@ -568,8 +581,6 @@ namespace internal {
   F(TurbofanStaticAssert, 1, 1)               \
   F(TypedArraySpeciesProtector, 0, 1)         \
   F(WaitForBackgroundOptimization, 0, 1)      \
-  F(WebSnapshotDeserialize, -1, 1)            \
-  F(WebSnapshotSerialize, -1, 1)              \
   I(DeoptimizeNow, 0, 1)
 
 #define FOR_EACH_INTRINSIC_TYPEDARRAY(F, I)    \
@@ -599,15 +610,28 @@ namespace internal {
   F(WasmTableGrow, 3, 1)              \
   F(WasmTableFill, 5, 1)              \
   F(WasmIsValidRefValue, 3, 1)        \
-  F(WasmCompileLazy, 2, 1)            \
+  F(WasmCompileLazy, 3, 1)            \
   F(WasmCompileWrapper, 2, 1)         \
   F(WasmTriggerTierUp, 1, 1)          \
   F(WasmDebugBreak, 0, 1)             \
   F(WasmArrayCopy, 5, 1)              \
-  F(WasmArrayInitFromData, 5, 1)      \
-  F(WasmAllocateContinuation, 1, 1)   \
+  F(WasmArrayNewSegment, 5, 1)        \
+  F(WasmAllocateSuspender, 0, 1)      \
   F(WasmSyncStackLimit, 0, 1)         \
-  F(WasmCreateResumePromise, 2, 1)
+  F(WasmCreateResumePromise, 2, 1)    \
+  F(WasmStringNewWtf8, 5, 1)          \
+  F(WasmStringNewWtf8Array, 4, 1)     \
+  F(WasmStringNewWtf16, 4, 1)         \
+  F(WasmStringNewWtf16Array, 3, 1)    \
+  F(WasmStringConst, 2, 1)            \
+  F(WasmStringMeasureUtf8, 1, 1)      \
+  F(WasmStringMeasureWtf8, 1, 1)      \
+  F(WasmStringEncodeWtf8, 5, 1)       \
+  F(WasmStringEncodeWtf16, 6, 1)      \
+  F(WasmStringEncodeWtf8Array, 4, 1)  \
+  F(WasmStringAsWtf8, 1, 1)           \
+  F(WasmStringViewWtf8Encode, 6, 1)   \
+  F(WasmStringViewWtf8Slice, 3, 1)
 
 #define FOR_EACH_INTRINSIC_WASM_TEST(F, I) \
   F(DeserializeWasmModule, 2, 1)           \
@@ -702,6 +726,7 @@ namespace internal {
   FOR_EACH_INTRINSIC_SHADOW_REALM(F, I)             \
   FOR_EACH_INTRINSIC_STRINGS(F, I)                  \
   FOR_EACH_INTRINSIC_SYMBOL(F, I)                   \
+  FOR_EACH_INTRINSIC_TEMPORAL(F, I)                 \
   FOR_EACH_INTRINSIC_TEST(F, I)                     \
   FOR_EACH_INTRINSIC_TYPEDARRAY(F, I)               \
   IF_WASM(FOR_EACH_INTRINSIC_WASM, F, I)            \

@@ -115,7 +115,7 @@ class TestLoader(testsuite.JSTestLoader):
 
   @property
   def excluded_dirs(self):
-    return {"intl402"} if self.test_config.noi18n else set()
+    return {"intl402", "Intl402"} if self.test_config.noi18n else set()
 
   def _should_filter_by_test(self, test):
     features = test.test_record.get("features", [])
@@ -123,8 +123,9 @@ class TestLoader(testsuite.JSTestLoader):
 
 
 class TestSuite(testsuite.TestSuite):
-  def __init__(self, *args, **kwargs):
-    super(TestSuite, self).__init__(*args, **kwargs)
+
+  def __init__(self, ctx, *args, **kwargs):
+    super(TestSuite, self).__init__(ctx, *args, **kwargs)
     self.test_root = os.path.join(self.root, *TEST_262_SUITE_PATH)
     # TODO: this makes the TestLoader mutable, refactor it.
     self._test_loader.test_root = self.test_root
@@ -252,7 +253,3 @@ class TestCase(testcase.D8TestCase):
     if self.expected_outcomes == outproc.OUTCOMES_PASS:
       return test262.PASS_NO_EXCEPTION
     return test262.NoExceptionOutProc(self.expected_outcomes)
-
-
-def GetSuite(*args, **kwargs):
-  return TestSuite(*args, **kwargs)

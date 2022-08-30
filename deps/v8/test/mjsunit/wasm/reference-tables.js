@@ -19,7 +19,7 @@ d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
         .addBody([kExprLocalGet, 0, kExprI32Const, 1, kExprI32Add])
         .exportFunc();
 
-    builder.addTable(wasmOptRefType(binary_type), 1, 100).exportAs('table');
+    builder.addTable(wasmRefNullType(binary_type), 1, 100).exportAs('table');
 
     return builder.instantiate({});
   })();
@@ -29,7 +29,7 @@ d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
     var builder = new WasmModuleBuilder();
     var unary_type = builder.addType(kSig_i_i);
     builder.addImportedTable(
-        'imports', 'table', 1, 100, wasmOptRefType(unary_type));
+        'imports', 'table', 1, 100, wasmRefNullType(unary_type));
     builder.instantiate({imports: {table: exporting_instance.exports.table}})
   }, WebAssembly.LinkError, /imported table does not match the expected type/)
 
@@ -47,10 +47,10 @@ d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
     var binary_type = builder.addType(kSig_i_ii);
 
     builder.addImportedTable(
-        'imports', 'table', 1, 100, wasmOptRefType(binary_type));
+        'imports', 'table', 1, 100, wasmRefNullType(binary_type));
 
     var table =
-        builder.addTable(wasmOptRefType(unary_type), 10).exportAs('table');
+        builder.addTable(wasmRefNullType(unary_type), 10).exportAs('table');
     builder.addTable(kWasmFuncRef, 1).exportAs('generic_table');
 
     builder
@@ -117,7 +117,7 @@ d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
           .exportFunc();
 
   var table = builder.addTable(wasmRefType(binary_type), 3, 3,
-                               WasmInitExpr.RefFunc(addition.index));
+                               [kExprRefFunc, addition.index]);
 
   builder.addFunction('init', kSig_v_v)
       .addBody([
@@ -147,41 +147,39 @@ d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
   print(arguments.callee.name);
   let builder = new WasmModuleBuilder();
 
-  let unary_type = builder.addType(kSig_i_i);
-  let binary_type = builder.addType(kSig_i_ii);
+  let array_type = builder.addArray(kWasmI32);
   let struct_type = builder.addStruct([makeField(kWasmI32, false)]);
-
-  let successor = builder.addFunction('addition', unary_type)
-    .addBody([kExprLocalGet, 0, kExprI32Const, 1, kExprI32Add]);
-
-  let subtraction = builder.addFunction('subtraction', binary_type)
-    .addBody([kExprLocalGet, 0, kExprLocalGet, 1, kExprI32Sub])
 
   let table = builder.addTable(kWasmAnyRef, 4, 4);
   builder.addActiveElementSegment(
-    table, WasmInitExpr.I32Const(0),
-    [WasmInitExpr.RefFunc(successor.index),
-     WasmInitExpr.RefFunc(subtraction.index),
-     WasmInitExpr.StructNew(struct_type, [WasmInitExpr.I32Const(10)]),
-     WasmInitExpr.RefNull(kWasmEqRef)],
+    table, wasmI32Const(0),
+    [[...wasmI32Const(111), ...wasmI32Const(222),
+      kGCPrefix, kExprArrayNewFixed, array_type, 2],
+     [...wasmI32Const(-31), kGCPrefix, kExprI31New],
+     [...wasmI32Const(10), kGCPrefix, kExprStructNew, struct_type],
+     [kExprRefNull, kEqRefCode]],
     kWasmAnyRef);
 
-  // return static_cast<i->i>(table[0])(local_0)
-  builder.addFunction("f0_getter", kSig_i_i)
+  // return ...static_cast<array_type>(table[0])(local_0)
+  builder.addFunction("array_getter", kSig_ii_i)
+    .addLocals(wasmRefNullType(array_type), 1)
     .addBody([
-      kExprLocalGet, 0,
       kExprI32Const, 0, kExprTableGet, 0,
-      kGCPrefix, kExprRefAsFunc, kGCPrefix, kExprRefCastStatic, unary_type,
-      kExprCallRef])
+      kGCPrefix, kExprRefAsArray,
+      kGCPrefix, kExprRefCastStatic, array_type,
+      kExprLocalSet, 1,
+      kExprLocalGet, 1,
+      ...wasmI32Const(0), kGCPrefix, kExprArrayGet, array_type,
+      kExprLocalGet, 1,
+      ...wasmI32Const(1), kGCPrefix, kExprArrayGet, array_type])
     .exportFunc();
 
-  // return static_cast<(i,i)->i>(table[1])(local_0, local_1)
-  builder.addFunction("f1_getter", kSig_i_ii)
+  // return static_cast<i31>(table[1])(local_0, local_1)
+  builder.addFunction("i31_getter", kSig_i_v)
    .addBody([
-     kExprLocalGet, 0, kExprLocalGet, 1,
      kExprI32Const, 1, kExprTableGet, 0,
-     kGCPrefix, kExprRefAsFunc, kGCPrefix, kExprRefCastStatic, binary_type,
-     kExprCallRef])
+     kGCPrefix, kExprRefAsI31,
+     kGCPrefix, kExprI31GetS])
    .exportFunc();
 
   // return static_cast<struct_type>(table[2]).field_0
@@ -201,8 +199,8 @@ d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
 
   assertTrue(!!instance);
 
-  assertEquals(43, instance.exports.f0_getter(42));
-  assertEquals(-7, instance.exports.f1_getter(12, 19));
+  assertEquals([111, 222], instance.exports.array_getter(42));
+  assertEquals(-31, instance.exports.i31_getter(12, 19));
   assertEquals(10, instance.exports.struct_getter());
   assertEquals(1, instance.exports.null_getter());
 })();
