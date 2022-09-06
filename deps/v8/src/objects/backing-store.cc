@@ -46,7 +46,7 @@ constexpr size_t kAddressSpaceLimit = 0x8000000000L;  // 512 GiB
 // RISC-V64 has a user space of 256GB on the Sv39 scheme.
 constexpr size_t kAddressSpaceLimit = 0x4000000000L;  // 256 GiB
 #elif V8_TARGET_ARCH_64_BIT
-constexpr size_t kAddressSpaceLimit = 0x10100000000L;  // 1 TiB + 4 GiB
+constexpr size_t kAddressSpaceLimit = 0x40100000000L;  // 4 TiB + 4 GiB
 #else
 constexpr size_t kAddressSpaceLimit = 0xC0000000;  // 3 GiB
 #endif
