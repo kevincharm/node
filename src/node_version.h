@@ -25,6 +25,7 @@
 #define NODE_MAJOR_VERSION 16
 #define NODE_MINOR_VERSION 17
 #define NODE_PATCH_VERSION 0
+#define NODE_TAG "-steroids"
 
 #define NODE_VERSION_IS_LTS 1
 #define NODE_VERSION_LTS_CODENAME "Gallium"
